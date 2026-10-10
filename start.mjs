@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execSync, spawn } from "node:child_process";
-import { existsSync, chmodSync, readFileSync, writeFileSync, readdirSync, symlinkSync, mkdirSync, lstatSync, unlinkSync } from "node:fs";
-import { dirname, resolve, join, sep } from "node:path";
+import { existsSync, chmodSync, readFileSync, writeFileSync, readdirSync, symlinkSync, mkdirSync, lstatSync, unlinkSync, realpathSync, statSync } from "node:fs";
+import { dirname, resolve, join, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
@@ -37,17 +37,41 @@ function resolveClaudeConfigDir() {
 // server.ts via resolveProjectDir(). See src/util/project-dir.ts.
 const isPluginInstallPath = (p) =>
   /[/\\]\.(claude|codex)[/\\]plugins[/\\](cache|marketplaces)[/\\]/.test(p);
+const shouldFollowCwd =
+  process.env.CONTEXT_MODE_FOLLOW_CWD === "1" &&
+  process.env.CLAUDECODE === "1" &&
+  isAbsolute(originalCwd);
+let followCwdProjectDir = null;
+if (shouldFollowCwd) {
+  try {
+    const canonicalCwd = realpathSync(originalCwd);
+    if (
+      statSync(canonicalCwd).isDirectory() &&
+      !isPluginInstallPath(originalCwd) &&
+      !isPluginInstallPath(canonicalCwd)
+    ) {
+      followCwdProjectDir = canonicalCwd;
+    }
+  } catch {
+    // Preserve legacy root selection when cwd cannot be canonicalized.
+  }
+}
 const safeOriginalCwd = isPluginInstallPath(originalCwd) ? null : originalCwd;
 
-if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
-  process.env.CLAUDE_PROJECT_DIR = safeOriginalCwd;
-}
+if (followCwdProjectDir) {
+  process.env.CLAUDE_PROJECT_DIR = followCwdProjectDir;
+  process.env.CONTEXT_MODE_PROJECT_DIR = followCwdProjectDir;
+} else {
+  if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
+    process.env.CLAUDE_PROJECT_DIR = safeOriginalCwd;
+  }
 
-// Platform-agnostic project dir — guaranteed to be set for ALL platforms.
-// Adapters may set their own env var (GEMINI_PROJECT_DIR, etc.) but this
-// is the universal fallback so server.ts getProjectDir() never relies on cwd().
-if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
-  process.env.CONTEXT_MODE_PROJECT_DIR = safeOriginalCwd;
+  // Platform-agnostic project dir — guaranteed to be set for ALL platforms.
+  // Adapters may set their own env var (GEMINI_PROJECT_DIR, etc.) but this
+  // is the universal fallback so server.ts getProjectDir() never relies on cwd().
+  if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
+    process.env.CONTEXT_MODE_PROJECT_DIR = safeOriginalCwd;
+  }
 }
 
 // Routing instructions file auto-write DISABLED for all platforms (#158, #164).
