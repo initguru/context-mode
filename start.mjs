@@ -100,6 +100,7 @@ if (typeof globalThis.Bun === "undefined" && process.platform === "linux") {
     const child = spawn(bunBin, [fileURLToPath(import.meta.url)], {
       stdio: ["pipe", "inherit", "inherit"],
       env: process.env,
+      ...(followCwdProjectDir ? { cwd: followCwdProjectDir } : {}),
     });
     const _keepAlive = setInterval(() => {}, 2147483647);
     let _escTerm;
@@ -355,6 +356,9 @@ try {
 import{existsSync,readdirSync,symlinkSync,lstatSync,unlinkSync,readFileSync,appendFileSync,mkdirSync}from"node:fs";
 import{dirname,join,resolve,sep}from"node:path";
 import{homedir}from"node:os";
+// Only this launcher's exact prerelease identity extends the numeric candidates.
+const artifactVersion=${JSON.stringify(JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8")).version)};
+const artifactCore=typeof artifactVersion==="string"?artifactVersion.match(/^(\\d+\\.\\d+\\.\\d+)-.+$/)?.[1]:null;
 function cfgDir(){const e=process.env.CLAUDE_CONFIG_DIR;if(e&&e.trim()!==""){return e.startsWith("~")?resolve(homedir(),e.replace(/^~[/\\\\]?/,"")):resolve(e)}return resolve(homedir(),".claude")}
 try{
   const f=resolve(cfgDir(),"plugins","installed_plugins.json");
@@ -387,7 +391,7 @@ try{
       const parent=dirname(p);
       if(!existsSync(parent))continue;
       try{if(lstatSync(p).isSymbolicLink())unlinkSync(p)}catch{}
-      const dirs=readdirSync(parent).filter(d=>/^\\d+\\.\\d+(\\.\\d+)?$/.test(d)&&lstatSync(join(parent,d)).isDirectory());
+      const dirs=readdirSync(parent).filter(d=>(/^\\d+\\.\\d+(\\.\\d+)?$/.test(d)||(artifactCore&&d===artifactVersion))&&lstatSync(join(parent,d)).isDirectory());
       if(!dirs.length){
         // Issue #1191: nothing valid to heal toward. Report via the same
         // log contract as hooks/run-hook.mjs logError (cfgDir() honors
@@ -399,7 +403,7 @@ try{
         }catch{}
         continue;
       }
-      dirs.sort((a,b)=>{const pa=a.split(".").map(Number),pb=b.split(".").map(Number);for(let i=0;i<3;i++){if((pa[i]||0)!==(pb[i]||0))return(pa[i]||0)-(pb[i]||0)}return 0});
+      dirs.sort((a,b)=>{const preA=!!artifactCore&&a===artifactVersion,preB=!!artifactCore&&b===artifactVersion;const pa=(preA?artifactCore:a).split("."),pb=(preB?artifactCore:b).split(".");for(let i=0;i<3;i++){const va=BigInt(pa[i]||"0"),vb=BigInt(pb[i]||"0");if(va!==vb)return va<vb?-1:1}if(preA!==preB)return preA?-1:1;return a<b?-1:a>b?1:0});
       try{symlinkSync(join(parent,dirs[dirs.length-1]),p,process.platform==="win32"?"junction":undefined)}catch{}
     }
   }

@@ -838,7 +838,7 @@ describe("Issues #1191 — healScript anchored version filter + unhealable-path 
     const startSrc = readFileSync(resolve(BREADCRUMB_ROOT, "start.mjs"), "utf-8");
     const m = startSrc.match(/const healScript = (`[\s\S]*?`);/);
     expect(m, "start.mjs must still embed the healScript template").not.toBeNull();
-    const healScript = new Function(`return ${m![1]};`)() as string;
+    const healScript = new Function("readFileSync", "resolve", "__dirname", `return ${m![1]};`)(readFileSync, resolve, BREADCRUMB_ROOT) as string;
     healScriptPath = join(fakeHome, "context-mode-cache-heal.mjs");
     writeFileSync(healScriptPath, healScript, "utf-8");
   });
@@ -924,6 +924,41 @@ describe("Issues #1191 — healScript anchored version filter + unhealable-path 
     expect(log).toContain(cacheParent);
   });
 
+  const artifact = JSON.parse(readFileSync(resolve(BREADCRUMB_ROOT, "package.json"), "utf8")).version as string;
+  test.each([
+    [[artifact], artifact],
+    [["1.0.168", artifact], artifact],
+    [[artifact, "1.0.170"], "1.0.170"],
+    [["1.0.169", artifact], "1.0.169"],
+    [[artifact, "1.0.169"], "1.0.169"],
+    [["1.0", artifact], artifact],
+    [["2.0", artifact], "2.0"],
+    [["2.0.0", "2.0"], "2.0.0"],
+    [["2.0", "2.0.0"], "2.0.0"],
+  ] as [string[], string][]) ("selects supported physical versions deterministically: %j -> %s", (versions, expected) => {
+    const cacheParent = makeCacheParent("supported-" + versions.join("_"));
+    for (const version of versions) mkdirSync(join(cacheParent, version), { recursive: true });
+    const installPath = join(cacheParent, "missing"); writeRegistry(installPath);
+    const result = runHealHook();
+    expect(result.status).toBe(0); expect(result.signal).toBeNull();
+    expect(existsSync(installPath)).toBe(true);
+    expect(realpathSync(installPath)).toBe(realpathSync(join(cacheParent, expected)));
+  });
+  test.each(["backup", "symlink", "file", "garbage", "empty"])("rejects unsupported/nonphysical candidates and logs: %s", kind => {
+    const cacheParent = makeCacheParent("rejected-" + kind);
+    if (kind === "backup") mkdirSync(join(cacheParent, artifact + ".bak-noop"));
+    if (kind === "garbage") for (const version of ["garbage", "1.0.999-other", "1.0.169.bak-noop"]) mkdirSync(join(cacheParent, version));
+    if (kind === "file") for (const version of [artifact, "9.0.0"]) writeFileSync(join(cacheParent, version), "not a directory");
+    if (kind === "symlink") {
+      const target = makeTmp();
+      for (const version of [artifact, "9.0.0"]) symlinkSync(target, join(cacheParent, version));
+    }
+    const installPath = join(cacheParent, "missing"); writeRegistry(installPath);
+    const result = runHealHook();
+    expect(result.status).toBe(0); expect(result.signal).toBeNull();
+    expect(existsSync(installPath)).toBe(false);
+    expect(readFileSync(join(cfgDir, "context-mode", "hook-errors.log"), "utf8")).toContain(cacheParent);
+  });
   test("positive control: real version dirs still get linked (highest wins)", () => {
     const cacheParent = makeCacheParent("clean");
     const older = join(cacheParent, "1.0.162");

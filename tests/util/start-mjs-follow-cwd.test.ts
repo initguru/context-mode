@@ -19,6 +19,35 @@ function run(cwd: string, env: Record<string, string> = {}, failRealpath = false
   });
   return process.env;
 }
+// Capture the actual Linux candidate/spawn seam, stopping before lifetime handlers.
+const spawnBegin = source.indexOf('if (typeof globalThis.Bun === "undefined"');
+const spawnEnd = source.indexOf("    const _keepAlive", spawnBegin);
+if (spawnBegin < 0 || spawnEnd <= spawnBegin) throw new Error("Production Bun spawn boundaries missing");
+const spawnSeam = source.slice(spawnBegin, spawnEnd).replaceAll("import.meta.url", '"file:///opt/context-mode/start.mjs"') + "\n}}";
+function relaunch(cwd: string, env: Record<string, string>, failRealpath = false) {
+  const install = "/opt/context-mode";
+  let inheritedCwd = cwd;
+  const parent = { env: { ...env }, platform: "linux", cwd: () => inheritedCwd, chdir: (p: string) => { inheritedCwd = p; } };
+  let options: { cwd?: string; env: Record<string, string>; stdio: string[] } | undefined;
+  const capturePrefix = source.slice(source.indexOf("const originalCwd ="), source.indexOf("// Resolve the Claude"));
+  runInNewContext(capturePrefix + bootstrap + spawnSeam, {
+    process: parent, __dirname: install, isAbsolute, statSync, join,
+    realpathSync: failRealpath ? () => { throw new Error("injected realpath failure"); } : realpathSync,
+    homedir: () => "/synthetic-home", existsSync: (p: string) => p === "/usr/bin/bun",
+    fileURLToPath: () => install + "/start.mjs",
+    spawn: (_bin: string, _args: string[], opts: NonNullable<typeof options>) => { options = opts; return {}; },
+  });
+  if (!options) throw new Error("Linux Bun seam did not spawn");
+  const childCwd = options.cwd ?? inheritedCwd;
+  const child = { env: { ...options.env } };
+  // The ordinary install is synthetic; all startup fixtures use the real owned FS.
+  runInNewContext(bootstrap, {
+    process: child, originalCwd: childCwd, isAbsolute,
+    realpathSync: (p: string) => p === install ? install : realpathSync(p),
+    statSync: (p: string) => p === install ? { isDirectory: () => true } : statSync(p),
+  });
+  return { parent: parent.env, child: child.env, options, childCwd, install };
+}
 const on = { CONTEXT_MODE_FOLLOW_CWD: "1", CLAUDECODE: "1" };
 const roots: string[] = [];
 function root() { const p = mkdtempSync(join(tmpdir(), "ctx-follow-")); roots.push(p); return realpathSync(p); }
@@ -60,6 +89,48 @@ describe("actual start.mjs FOLLOW_CWD bootstrap", () => {
       expect(run(installedAlias, { ...old, ...on })).toEqual({ ...old, ...on });
     });
   }
+  it.each([false, true])("preserves both canonical startup roots through ordinary-install Linux Bun re-exec (symlink=%s)", alias => {
+    const cwd = root(); const startup = alias ? join(root(), "project") : cwd;
+    if (alias) symlinkSync(cwd, startup);
+    const result = relaunch(startup, { ...old, ...on });
+    expect(result.options.cwd).toBe(cwd);
+    expect(result.childCwd).toBe(cwd);
+    expect(result.parent).toEqual({ ...on, CLAUDE_PROJECT_DIR: cwd, CONTEXT_MODE_PROJECT_DIR: cwd });
+    expect(result.child).toEqual(result.parent);
+    expect(result.options.stdio).toEqual(["pipe", "inherit", "inherit"]);
+    expect(result.options.env).toBe(result.parent);
+  });
+  it.each([{}, { CONTEXT_MODE_FOLLOW_CWD: "0", CLAUDECODE: "1" }, { CONTEXT_MODE_FOLLOW_CWD: "1" }, { CONTEXT_MODE_FOLLOW_CWD: "true", CLAUDECODE: "1" }, { CONTEXT_MODE_FOLLOW_CWD: "1", CLAUDECODE: "true" }])("retains inherited Bun cwd for rejected flags: %j", flags => {
+    const result = relaunch(root(), { ...old, ...flags });
+    expect(result.options).not.toHaveProperty("cwd");
+    expect(result.childCwd).toBe(result.install);
+    expect(result.child).toEqual({ ...old, ...flags });
+  });
+  it("retains opt-off unset-root fallback across re-exec", () => {
+    const cwd = root(); const result = relaunch(cwd, {});
+    expect(result.options).not.toHaveProperty("cwd");
+    expect(result.child).toEqual({ CLAUDE_PROJECT_DIR: cwd, CONTEXT_MODE_PROJECT_DIR: cwd });
+  });
+  it.each(["relative/path", "/missing/context-mode-follow-cwd-test"])("retains inherited Bun cwd for invalid startup: %s", cwd => {
+    const result = relaunch(cwd, { ...old, ...on });
+    expect(result.options).not.toHaveProperty("cwd");
+    expect(result.parent).toEqual({ ...old, ...on });
+  });
+  it("retains inherited Bun cwd for failed canonicalization", () => {
+    const result = relaunch(root(), { ...old, ...on }, true);
+    expect(result.options).not.toHaveProperty("cwd");
+    expect(result.parent).toEqual({ ...old, ...on });
+  });
+  it("retains inherited Bun cwd for original and canonical plugin exclusions", () => {
+    const base = root(); const plugin = join(base, ".claude", "plugins", "cache", "context-mode");
+    mkdirSync(plugin, { recursive: true });
+    const alias = join(base, "alias"); symlinkSync(plugin, alias);
+    for (const cwd of [plugin, alias]) {
+      const result = relaunch(cwd, { ...old, ...on });
+      expect(result.options).not.toHaveProperty("cwd");
+      expect(result.parent).toEqual({ ...old, ...on });
+    }
+  });
   it("ships the opt-in in the Claude manifest", () => {
     const manifest = JSON.parse(readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
     expect(manifest.mcpServers["context-mode"].env.CONTEXT_MODE_FOLLOW_CWD).toBe("1");
