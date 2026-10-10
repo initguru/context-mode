@@ -19,7 +19,7 @@
  * @see https://github.com/mksglu/context-mode/issues/203
  */
 
-import { existsSync, copyFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, copyFileSync, renameSync, unlinkSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -127,15 +127,58 @@ function probeNativeInProcess(pluginRoot) {
   }
 }
 
+// Identity of the ABI cache and of the active binary it was installed as.
+// The active binary cannot be byte-compared with the cache (ad-hoc codesign
+// rewrites it), so a swap records both stats in a stamp file and later calls
+// skip the copy + codesign + rename while they still match (#1196). Anything
+// else that replaces the active binary (npm rebuild, another ABI's swap)
+// changes its stat and forces a fresh swap.
+function nativeSwapStamp(abiCachePath, binaryPath) {
+  try {
+    const c = statSync(abiCachePath);
+    const b = statSync(binaryPath);
+    return `${abiCachePath}:${c.size}:${c.mtimeMs}:${c.ino}|${b.size}:${b.mtimeMs}:${b.ino}`;
+  } catch {
+    return null;
+  }
+}
+
 function replaceActiveNativeBinaryFromCache(abiCachePath, binaryPath) {
+  const stampPath = `${binaryPath}.swap-stamp`;
+  const current = nativeSwapStamp(abiCachePath, binaryPath);
+  if (current !== null) {
+    try {
+      if (readFileSync(stampPath, "utf8") === current) return;
+    } catch { /* no stamp yet — swap below */ }
+  }
   const tmpPath = `${binaryPath}.staging-${process.pid}-${Date.now()}`;
+  const cacheSnapshot = nativeSwapStamp(abiCachePath, abiCachePath);
+  let installed = null;
   try {
     copyFileSync(abiCachePath, tmpPath);
-    codesignBinary(tmpPath);
+    const signed = codesignBinary(tmpPath);
+    // Bind the stamp to what this call actually copied and signed, not to
+    // whichever binary another ABI may install after our rename.
+    const staged = signed ? nativeSwapStamp(abiCachePath, tmpPath) : null;
+    if (staged !== null && cacheSnapshot !== null &&
+        staged.slice(0, staged.lastIndexOf("|")) ===
+        cacheSnapshot.slice(0, cacheSnapshot.lastIndexOf("|"))) {
+      installed = staged;
+    }
     renameSync(tmpPath, binaryPath);
   } catch (err) {
     try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
     throw err;
+  }
+  // Signing/stat failures or concurrent replacement retain the legacy retry.
+  // Publish only our staging identity; a later replacement cannot be certified.
+  if (installed === null || nativeSwapStamp(abiCachePath, binaryPath) !== installed) return;
+  const stampTmp = `${stampPath}.${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(stampTmp, installed);
+    renameSync(stampTmp, stampPath);
+  } catch {
+    try { unlinkSync(stampTmp); } catch { /* best effort cleanup */ }
   }
 }
 
@@ -243,8 +286,9 @@ export function codesignBinary(binaryPath) {
         stdio: "pipe",
         timeout: 10000,
       });
-    } catch { /* codesign unavailable — continue without signing */ }
+    } catch { return false; /* best-effort swap, but retry signing next time */ }
   }
+  return true; // successful signing, or no signing needed on this platform
 }
 
 // Auto-run on import (like suppress-stderr.mjs).

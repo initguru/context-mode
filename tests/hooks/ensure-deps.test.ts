@@ -12,7 +12,8 @@
 
 import { describe, test, expect, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { runInNewContext } from "node:vm";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -345,6 +346,167 @@ try {
     if (result.error) throw result.error;
     const out = JSON.parse(result.stdout.trim());
     expect(out).toEqual({ threw: false });
+  });
+});
+
+describe("ensure-deps: fast path skips a redundant cache swap (#1196)", () => {
+  // Every hook call imports ensure-deps.mjs. Without a swap stamp the fast
+  // path copied, codesigned and renamed the ABI cache over the active binary
+  // on every call, so the active binary got a new inode each time.
+  function setup() {
+    const root = createTempRoot();
+    const releaseDir = join(root, "node_modules", "better-sqlite3", "build", "Release");
+    mkdirSync(releaseDir, { recursive: true });
+    const binaryPath = join(releaseDir, "better_sqlite3.node");
+    const cachePath = join(releaseDir, `better_sqlite3.abi${process.versions.modules}.node`);
+    writeFileSync(binaryPath, "ACTIVE-binary");
+    writeFileSync(cachePath, "CACHED-binary");
+    const harnessPath = join(root, "_swap-stamp-harness.mjs");
+    writeFileSync(harnessPath, `
+// These text fixtures are not signable Mach-O binaries. Exercise successful
+// no-signing swaps here; macOS success/failure is covered deterministically below.
+Object.defineProperty(process, "platform", { value: "linux" });
+const { ensureNativeCompat } = await import(${JSON.stringify("file://" + ensureDepsAbsPath.replace(/\\/g, "/"))});
+ensureNativeCompat(${JSON.stringify(root)});
+`, "utf-8");
+    const run = () => {
+      const result = spawnSync("node", [harnessPath], {
+        encoding: "utf-8",
+        timeout: 30_000,
+        cwd: join(fileURLToPath(import.meta.url), "..", ".."),
+      });
+      if (result.error) throw result.error;
+      expect(result.signal).toBeNull();
+      expect(result.status).toBe(0);
+      return statSync(binaryPath).ino;
+    };
+    return { releaseDir, binaryPath, cachePath, run };
+  }
+
+  test("second call leaves the swapped-in binary untouched", () => {
+    const { binaryPath, releaseDir, run } = setup();
+    const first = run();
+    expect(readFileSync(binaryPath, "utf-8")).toBe("CACHED-binary");
+    expect(run()).toBe(first);
+    expect(readdirSync(releaseDir).filter((f) => f.includes(".staging-"))).toEqual([]);
+  });
+
+  test("a changed ABI cache is swapped in again", () => {
+    const { binaryPath, cachePath, run } = setup();
+    const first = run();
+    writeFileSync(cachePath, "NEWER-cached-binary");
+    expect(run()).not.toBe(first);
+    expect(readFileSync(binaryPath, "utf-8")).toBe("NEWER-cached-binary");
+  });
+
+  test("an active binary replaced from outside is swapped again", () => {
+    const { binaryPath, run } = setup();
+    run();
+    writeFileSync(binaryPath, "REBUILT-elsewhere");
+    run();
+    expect(readFileSync(binaryPath, "utf-8")).toBe("CACHED-binary");
+  });
+});
+
+describe("ensure-deps: swap stamp safety", () => {
+  function fixture() {
+    const src = readFileSync(ensureDepsAbsPath, "utf-8");
+    const functions = ["nativeSwapStamp", "replaceActiveNativeBinaryFromCache", "codesignBinary"].map((name) => {
+      const match = src.match(new RegExp(`^(?:export\\s+)?function ${name}\\b[\\s\\S]*?^}`, "m"));
+      if (!match) throw new Error(`Missing source function: ${name}`);
+      return match[0].replace(/^export\s+/, "");
+    }).join("\n");
+    type File = { content: string; size: number; mtimeMs: number; ino: number };
+    const files = new Map<string, File>();
+    let clock = 0;
+    let copies = 0;
+    let signs = 0;
+    let afterCopy = () => {};
+    let afterInstall = () => {};
+    let failSign = false;
+    const put = (path: string, content: string) => {
+      files.set(path, { content, size: content.length, mtimeMs: ++clock, ino: clock });
+    };
+    const get = (path: string) => {
+      const file = files.get(path);
+      if (!file) throw new Error(`Missing fixture file: ${path}`);
+      return file;
+    };
+    put("cache-A", "ABI-A");
+    put("active", "OLD");
+    const swap = runInNewContext(`${functions}\nreplaceActiveNativeBinaryFromCache`, {
+      process: { pid: 1, platform: "darwin" },
+      statSync: (path: string) => ({ ...get(path) }),
+      readFileSync: (path: string) => get(path).content,
+      writeFileSync: put,
+      unlinkSync: (path: string) => files.delete(path),
+      copyFileSync: (from: string, to: string) => {
+        copies++;
+        put(to, get(from).content);
+        afterCopy();
+      },
+      renameSync: (from: string, to: string) => {
+        files.set(to, get(from));
+        files.delete(from);
+        if (to === "active") afterInstall();
+      },
+      execSync: () => {
+        signs++;
+        if (failSign) throw new Error("Transient signing failure");
+      },
+    }) as (cache: string, active: string) => void;
+    return {
+      run: () => swap("cache-A", "active"),
+      content: () => get("active").content,
+      stamped: () => files.has("active.swap-stamp"),
+      copies: () => copies,
+      signs: () => signs,
+      replace: put,
+      onCopy: (fn: () => void) => { afterCopy = fn; },
+      onInstall: (fn: () => void) => { afterInstall = fn; },
+      failSigning: (fail: boolean) => { failSign = fail; },
+    };
+  }
+
+  test("another ABI replacing active after rename is not certified by this swap", () => {
+    const f = fixture();
+    f.onInstall(() => f.replace("active", "ABI-B"));
+    f.run();
+    expect(f.content()).toBe("ABI-B");
+    expect(f.stamped()).toBe(false);
+    f.onInstall(() => {});
+    f.run();
+    expect(f.content()).toBe("ABI-A");
+    expect(f.copies()).toBe(2);
+    f.run();
+    expect(f.copies()).toBe(2);
+  });
+
+  test("a cache changed during copy is not certified as installed", () => {
+    const f = fixture();
+    f.onCopy(() => f.replace("cache-A", "NEW-A"));
+    f.run();
+    expect(f.content()).toBe("ABI-A");
+    expect(f.stamped()).toBe(false);
+    f.onCopy(() => {});
+    f.run();
+    expect(f.content()).toBe("NEW-A");
+    expect(f.copies()).toBe(2);
+  });
+
+  test("failed signing keeps best-effort swap but retries until successful then skips", () => {
+    const f = fixture();
+    f.failSigning(true);
+    expect(() => f.run()).not.toThrow();
+    expect(f.content()).toBe("ABI-A");
+    expect(f.stamped()).toBe(false);
+    f.failSigning(false);
+    f.run();
+    expect(f.signs()).toBe(2);
+    expect(f.stamped()).toBe(true);
+    f.run();
+    expect(f.signs()).toBe(2);
+    expect(f.copies()).toBe(2);
   });
 });
 
