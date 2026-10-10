@@ -8,7 +8,7 @@
  * chunk regardless of size) makes these tests fail — a stored chunk exceeds the
  * cap. With the fix, every persisted plain-text chunk is <= MAX_CHUNK_BYTES.
  */
-import { describe, test } from "vitest";
+import { describe, test, vi } from "vitest";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -114,6 +114,127 @@ describe("#chunkPlainText byte cap (#781)", () => {
     assert.ok(sizes.length >= 2, `expected the emoji line to be split, got ${sizes.length} chunk(s)`);
     for (const bytes of sizes) {
       assert.ok(bytes <= MAX_CHUNK_BYTES, `chunk of ${bytes}B exceeds cap ${MAX_CHUNK_BYTES}`);
+    }
+  });
+
+  test("large structured single lines have linear byte-count work and conserve Unicode content", () => {
+    const originalByteLength = Buffer.byteLength;
+    const measure = (format: "markdown" | "json", repeats: number) => {
+      const dbPath = tmpDbPath(`linear-${format}-${repeats}`);
+      const store = new ContentStore(dbPath);
+      const payload = "你🎉x".repeat(repeats);
+      const content = format === "markdown" ? `# Heading\n\n${payload}` : JSON.stringify(payload);
+      let work = 0;
+      const spy = vi.spyOn(Buffer, "byteLength").mockImplementation((value, encoding) => {
+        if (typeof value === "string") work += value.length;
+        return originalByteLength(value, encoding);
+      });
+      try {
+        if (format === "markdown") store.index({ content, source: "linear-markdown" });
+        else store.indexJSON(content, "linear-json");
+      } finally {
+        spy.mockRestore();
+        store.close();
+      }
+      const Database = loadDatabase();
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        const rows = db.prepare("SELECT title, content FROM chunks ORDER BY rowid").all() as Array<{ title: string; content: string }>;
+        const parts = format === "markdown" ? rows.filter((row) => row.content !== "# Heading") : rows;
+        assert.equal(parts.map((row) => row.content).join(""), format === "markdown" ? payload : content);
+        for (const row of parts) {
+          assert.ok(originalByteLength(row.content) <= MAX_CHUNK_BYTES);
+          assert.ok(!row.content.includes("�"), "Unicode must remain valid");
+          assert.ok(row.title.length > 0, "part titles must be retained");
+        }
+      } finally {
+        db.close();
+      }
+      return work;
+    };
+    for (const format of ["markdown", "json"] as const) {
+      const small = measure(format, 131072);
+      const large = measure(format, 262144);
+      assert.ok(large <= small * 2.2, `${format} byte-count work must scale linearly: ${small} -> ${large}`);
+    }
+  });
+
+  test("a single oversized markdown paragraph is split by UTF-8 bytes", () => {
+    const dbPath = tmpDbPath("markdown-paragraph");
+    const store = new ContentStore(dbPath);
+    // No blank-line boundary exists inside this paragraph. CJK makes a
+    // character-count split insufficient: 4096 code points are 12288 bytes.
+    store.index({ content: `# Heading\n\n${"你".repeat(MAX_CHUNK_BYTES)}`, source: "markdown-paragraph" });
+    store.close();
+
+    const sizes = storedChunkSizes(dbPath);
+    assert.ok(sizes.length >= 2, `expected the paragraph to be split, got ${sizes.length} chunk(s)`);
+    for (const bytes of sizes) {
+      assert.ok(bytes <= MAX_CHUNK_BYTES, `chunk of ${bytes}B exceeds cap ${MAX_CHUNK_BYTES}`);
+    }
+  });
+
+  test("an oversized fenced code block stays byte-capped and classified as code", () => {
+    const dbPath = tmpDbPath("markdown-code");
+    const store = new ContentStore(dbPath);
+    store.index({
+      content: `# Code\n\n\`\`\`typescript\n${"const value = 1; ".repeat(MAX_CHUNK_BYTES)}\n\`\`\``,
+      source: "markdown-code",
+    });
+    store.close();
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db.prepare("SELECT content, content_type FROM chunks").all() as Array<{
+        content: string;
+        content_type: string;
+      }>;
+      assert.ok(rows.length >= 2, `expected the code block to be split, got ${rows.length} chunk(s)`);
+      assert.ok(rows.some((row) => row.content_type === "code"), "the fenced chunk must remain code");
+      for (const row of rows) {
+        const bytes = Buffer.byteLength(row.content);
+        assert.ok(bytes <= MAX_CHUNK_BYTES, `chunk of ${bytes}B exceeds cap ${MAX_CHUNK_BYTES}`);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an oversized JSON primitive is split before persistence", () => {
+    const dbPath = tmpDbPath("json-primitive");
+    const store = new ContentStore(dbPath);
+    store.indexJSON(JSON.stringify({ payload: "🎉".repeat(MAX_CHUNK_BYTES) }), "json-primitive");
+    store.close();
+
+    const sizes = storedChunkSizes(dbPath);
+    assert.ok(sizes.length >= 2, `expected the JSON primitive to be split, got ${sizes.length} chunk(s)`);
+    for (const bytes of sizes) {
+      assert.ok(bytes <= MAX_CHUNK_BYTES, `chunk of ${bytes}B exceeds cap ${MAX_CHUNK_BYTES}`);
+    }
+  });
+
+  test("an oversized singleton JSON array item is split before persistence", () => {
+    const dbPath = tmpDbPath("json-array-item");
+    const store = new ContentStore(dbPath);
+    store.indexJSON(JSON.stringify([{ id: "item-1", payload: "x".repeat(MAX_CHUNK_BYTES * 3) }]), "json-array-item");
+    store.close();
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db.prepare("SELECT content, content_type FROM chunks").all() as Array<{
+        content: string;
+        content_type: string;
+      }>;
+      assert.ok(rows.length >= 2, `expected the singleton item to be split, got ${rows.length} chunk(s)`);
+      assert.ok(rows.every((row) => row.content_type === "code"), "split JSON array chunks must remain code");
+      for (const row of rows) {
+        const bytes = Buffer.byteLength(row.content);
+        assert.ok(bytes <= MAX_CHUNK_BYTES, `chunk of ${bytes}B exceeds cap ${MAX_CHUNK_BYTES}`);
+      }
+    } finally {
+      db.close();
     }
   });
 });
