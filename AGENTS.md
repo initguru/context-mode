@@ -11,7 +11,7 @@ source·설치·권한 변경은 각각 승인된 범위에서만 수행하고, 
 - 두 name이 context-mode인 경우 식별자는 `context-mode@context-mode`다.
 - 등록 source(directory/GitHub)와 catalog의 plugin entry source는 별개다. fork push만으로 directory 설치본이 갱신되지 않는다.
 - 기존 scope/version/install path, accepted commit과 exact inventory/hash, 독립 검증 결과를 확인한다.
-- `plugin.json` version이 authoritative다. 기존 version-sync의 10 manifests lockstep과 식별 가능한 fork prerelease를 검증한다.
+- `plugin.json` version이 authoritative다. 기존 version-sync의 10 TARGETS/12 version fields lockstep과 승인된 artifact identity를 검증한다. `1.7.0`은 사용자 fork의 배포 identity이며 upstream 공식 release/npm 배포라고 표현하지 않는다.
 - computed version이 같으면 cache skip 가능성이 있다. version만 올리거나 exit 0만 보고 새 bytes 배포를 PASS로 처리하지 않는다.
 - accepted runtime/build commit과 documentation HEAD를 구분한다. 문서 변경만으로 bundle/version을 다시 올리지 않는다.
 
@@ -37,8 +37,10 @@ claude plugin install "$PLUGIN_ID" --scope "$SCOPE"
 ```
 
 - add/install 기본 user와 update 기본 auto-detect를 신뢰해 scope를 생략하지 않는다. managed는 관리 주체 승인 대상이다.
-- 기존 directory 등록은 accepted bytes의 승인된 exact source publication을 먼저 완료한다.
-- directory 등록을 유지한 catalog source-only immutable pin은 **별도 actual 승인**이 있을 때만 선택한다.
+- 기본 공급 경로는 **검증된 fork remote exact commit → 별도 빈 위치의 fresh fetch/export → 전체 tracked paths/modes/hashes 일치 → 기존 directory marketplace 안의 새 relative plugin payload → 공식 설치**다. 로컬 export에서 version만 바꾼 것으로 remote 배포를 완료했다고 하지 않는다.
+- 기존 directory 등록을 유지한다. 승인된 새 payload `plugins/context-mode-1.7.0`과 catalog plugin source `./plugins/context-mode-1.7.0`, entry.version `1.7.0`을 expected-absent/보존 gate 뒤 게시한다. 기존 root-owned .git/hooks/node_modules를 교체하거나 Git safe.directory/권한을 바꾸지 않는다.
+- exact CLI binary를 사용해 catalog validate와 same-directory marketplace add의 실제 결과를 확인한다. user1 및 기존 local16은 각각 승인된 scope/실제 project cwd에서 context-mode만 공식 install/update한다. CLI gitCommitSha가 오래되거나 없을 수 있으므로 directory source/version/전체 payload hash를 content authority로 검증하며 registry SHA를 직접 수정하지 않는다.
+- 아래 **GitHub immutable pin은 기본 local relative source와 다른 별도 대안**이다. directory 등록을 유지한 catalog source-only immutable pin은 **별도 actual 승인**이 있을 때만 선택한다.
 - 해당 selected entry만 `source: { source: "github", repo: "<approved-owner/repo>", sha: "<accepted-40-hex-SHA>" }`로 변경한다.
 - SHA는 검증·push·readback된 40자리 immutable commit이어야 한다. moving branch/현재 HEAD로 대체하지 않는다.
 - catalog의 비대상 필드와 등록 directory를 보존하고 official validation을 확인한다. remote의 `plugin.json` version/hash를 최종 기준으로 검증한다.

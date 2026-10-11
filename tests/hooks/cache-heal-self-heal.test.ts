@@ -925,12 +925,17 @@ describe("Issues #1191 — healScript anchored version filter + unhealable-path 
   });
 
   const artifact = JSON.parse(readFileSync(resolve(BREADCRUMB_ROOT, "package.json"), "utf8")).version as string;
+  // Stable same-core precedence and newer-core selection must remain meaningful
+  // when the artifact changes from a fork prerelease to a stable release.
+  const artifactCore = artifact.split("-")[0]!;
+  const [major, minor, patch] = artifactCore.split(".").map(Number);
+  const newerCore = `${major}.${minor}.${patch! + 1}`;
   test.each([
     [[artifact], artifact],
     [["1.0.168", artifact], artifact],
-    [[artifact, "1.0.170"], "1.0.170"],
-    [["1.0.169", artifact], "1.0.169"],
-    [[artifact, "1.0.169"], "1.0.169"],
+    [[artifact, newerCore], newerCore],
+    [[artifactCore, artifact], artifactCore],
+    [[artifact, artifactCore], artifactCore],
     [["1.0", artifact], artifact],
     [["2.0", artifact], "2.0"],
     [["2.0.0", "2.0"], "2.0.0"],
@@ -943,6 +948,28 @@ describe("Issues #1191 — healScript anchored version filter + unhealable-path 
     expect(result.status).toBe(0); expect(result.signal).toBeNull();
     expect(existsSync(installPath)).toBe(true);
     expect(realpathSync(installPath)).toBe(realpathSync(join(cacheParent, expected)));
+  });
+  test.each([false, true])("same-core stable beats a trusted synthetic prerelease (reverse=%s)", reverse => {
+    const prerelease = `${artifactCore}-test`;
+    const versions = reverse ? [prerelease, artifactCore] : [artifactCore, prerelease];
+    const cacheParent = makeCacheParent(`same-core-prerelease-${reverse}`);
+    for (const version of versions) mkdirSync(join(cacheParent, version), { recursive: true });
+    const startSrc = readFileSync(resolve(BREADCRUMB_ROOT, "start.mjs"), "utf8");
+    const template = startSrc.match(/const healScript = (`[\s\S]*?`);/)![1];
+    const fixtureRead = (file: string, encoding: string) => file === resolve(BREADCRUMB_ROOT, "package.json")
+      ? JSON.stringify({ version: prerelease })
+      : readFileSync(file, encoding as "utf8");
+    const script = new Function("readFileSync", "resolve", "__dirname", `return ${template};`)(fixtureRead, resolve, BREADCRUMB_ROOT) as string;
+    writeFileSync(healScriptPath, script, "utf8");
+    try {
+      const installPath = join(cacheParent, "missing"); writeRegistry(installPath);
+      const result = runHealHook();
+      expect(result.status).toBe(0); expect(result.signal).toBeNull();
+      expect(realpathSync(installPath)).toBe(realpathSync(join(cacheParent, artifactCore)));
+    } finally {
+      const script = new Function("readFileSync", "resolve", "__dirname", `return ${template};`)(readFileSync, resolve, BREADCRUMB_ROOT) as string;
+      writeFileSync(healScriptPath, script, "utf8");
+    }
   });
   test.each(["backup", "symlink", "file", "garbage", "empty"])("rejects unsupported/nonphysical candidates and logs: %s", kind => {
     const cacheParent = makeCacheParent("rejected-" + kind);
