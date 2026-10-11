@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execSync, spawn } from "node:child_process";
-import { existsSync, chmodSync, readFileSync, writeFileSync, readdirSync, symlinkSync, mkdirSync, lstatSync, unlinkSync, realpathSync, statSync } from "node:fs";
-import { dirname, resolve, join, sep, isAbsolute } from "node:path";
+import { existsSync, chmodSync, readFileSync, writeFileSync, symlinkSync, mkdirSync, lstatSync, unlinkSync, realpathSync, statSync } from "node:fs";
+import { dirname, resolve, join, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
@@ -172,76 +172,62 @@ if (cacheMatch) {
     const claudeConfigDir = resolveClaudeConfigDir();
     const ipPath = resolve(claudeConfigDir, "plugins", "installed_plugins.json");
 
-    // Forward heal: if a newer version dir exists, update registry
-    const dirs = readdirSync(cacheParent).filter((d) =>
-      /^\d+\.\d+\.\d+/.test(d),
-    );
-    if (dirs.length > 1) {
-      dirs.sort((a, b) => {
-        const pa = a.split(".").map(Number);
-        const pb = b.split(".").map(Number);
-        for (let i = 0; i < 3; i++) {
-          if ((pa[i] ?? 0) !== (pb[i] ?? 0))
-            return (pa[i] ?? 0) - (pb[i] ?? 0);
-        }
-        return 0;
-      });
-      const newest = dirs[dirs.length - 1];
-      if (newest && newest !== myVersion) {
-        // Issue #727: normalize hooks.json + plugin.json in the newest version
-        // dir BEFORE updating the registry. CC's auto-update carries forward
-        // files from the old cache dir, including hooks.json and plugin.json
-        // with absolute paths baked to the old version. start.mjs's Self-heal
-        // Layer 5 would catch this, but plugin.json's stale mcpServers path
-        // prevents the new start.mjs from ever booting — chicken-and-egg.
-        // Fix: normalize from HERE (the old start.mjs that CC CAN still launch)
-        // so the new dir's files are correct before the next session reads them.
-        const newestDir = resolve(cacheParent, newest);
+    const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
+    const entries = ip?.plugins?.["context-mode@context-mode"];
+    if (Array.isArray(entries)) {
+      // Recovery is to this reachable physical payload, never a sibling upgrade.
+      // Healthy records (including aliases and other scopes) are left verbatim.
+      const parent = resolve(cacheParent);
+      const pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf-8"));
+      const manifest = JSON.parse(readFileSync(join(__dirname, ".claude-plugin", "plugin.json"), "utf-8"));
+      const launcher = join(__dirname, "start.mjs");
+      const admitted =
+        (/^\d+\.\d+\.\d+$/.test(myVersion) ||
+          (/^\d+\.\d+\.\d+-[^/\\]+$/.test(myVersion) && myVersion === pkg.version)) &&
+        pkg.name === "context-mode" && manifest.name === "context-mode" &&
+        pkg.version === myVersion && manifest.version === myVersion &&
+        lstatSync(__dirname).isDirectory() && !lstatSync(__dirname).isSymbolicLink() &&
+        realpathSync(parent) === parent && realpathSync(__dirname) === __dirname &&
+        lstatSync(launcher).isFile() && readFileSync(launcher).length > 0;
+      // One shared admission/deadness guard for both directions. Direct version
+      // children only: no traversal, foreign lineage or symlink-parent escape.
+      const eligibleDeadPath = (entry) => {
+        if (!admitted || !entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+        const rp = entry.installPath;
+        if (typeof rp !== "string" || !isAbsolute(rp) || rp !== resolve(rp) ||
+            dirname(rp) !== parent || rp === __dirname) return false;
         try {
-          // #713: use narrow helper — wide normalizeHooksOnStartup would
-          // write plugin.json on the NEW cache dir, the exact #711 poison
-          // vector. Only hooks.json needs the placeholder→absolute rewrite
-          // pre-bump to close the first-hook-fire window.
-          const { normalizeHooksJsonOnly } = await import("./hooks/normalize-hooks.mjs");
-          normalizeHooksJsonOnly({
-            pluginRoot: newestDir,
-            nodePath: process.execPath,
-            platform: process.platform,
-          });
-        } catch { /* best effort — never block startup */ }
-
-        const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
-        for (const [key, entries] of Object.entries(ip.plugins || {})) {
-          if (key !== "context-mode@context-mode") continue;
-          for (const entry of entries) {
-            entry.installPath = newestDir;
-            entry.version = newest;
-            entry.lastUpdated = new Date().toISOString();
-          }
+          statSync(rp); // Existing directories, files and healthy aliases all skip.
+          return false;
+        } catch (error) {
+          if (error?.code !== "ENOENT") return false;
         }
-        writeFileSync(ipPath, JSON.stringify(ip, null, 2) + "\n", "utf-8");
+        try {
+          // A dangling alias needs definite ENOENT from following its target.
+          return lstatSync(rp).isSymbolicLink();
+        } catch (error) {
+          return error?.code === "ENOENT";
+        }
+      };
+      let changed = false;
+      for (const entry of entries) {
+        if (!eligibleDeadPath(entry)) continue;
+        entry.installPath = __dirname;
+        entry.version = myVersion;
+        entry.lastUpdated = new Date().toISOString();
+        changed = true;
       }
-    }
+      if (changed) writeFileSync(ipPath, JSON.stringify(ip, null, 2) + "\n", "utf-8");
 
-    // Reverse heal: if registry points to non-existent dir, create symlink to us
-    const cacheRoot = resolve(claudeConfigDir, "plugins", "cache");
-    if (existsSync(ipPath)) {
-      const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
-      for (const [key, entries] of Object.entries(ip.plugins || {})) {
-        if (key !== "context-mode@context-mode") continue;
-        for (const entry of entries) {
-          const rp = entry.installPath;
-          if (!rp || existsSync(rp) || rp === __dirname) continue;
-          // Path traversal guard: only allow paths inside plugin cache
-          if (!resolve(rp).startsWith(cacheRoot + sep)) continue;
-          try {
-            // Remove dangling symlink before creating new one
-            try { if (lstatSync(rp).isSymbolicLink()) unlinkSync(rp); } catch {}
-            const rpParent = dirname(rp);
-            if (!existsSync(rpParent)) mkdirSync(rpParent, { recursive: true });
-            symlinkSync(__dirname, rp, process.platform === "win32" ? "junction" : undefined);
-          } catch { /* best effort */ }
-        }
+      // Retain reverse recovery with exactly the forward admission policy.
+      // Forward-recovered entries now exist and cannot qualify a second time.
+      for (const entry of entries) {
+        if (!eligibleDeadPath(entry)) continue;
+        const rp = entry.installPath;
+        try {
+          try { if (lstatSync(rp).isSymbolicLink()) unlinkSync(rp); } catch {}
+          symlinkSync(__dirname, rp, process.platform === "win32" ? "junction" : undefined);
+        } catch { /* best effort */ }
       }
     }
   } catch {
